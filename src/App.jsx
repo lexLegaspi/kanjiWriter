@@ -126,6 +126,25 @@ function shuffle(arr) {
 const QUIZ_KANJI = shuffle(N5_KANJI).slice(0, 20);
 const SZ = 320;
 
+// ── Load hanzi-writer script once ────────────────────────────────────────────
+let hwScriptPromise = null;
+function loadHanziWriter() {
+  if (hwScriptPromise) return hwScriptPromise;
+  hwScriptPromise = new Promise((resolve, reject) => {
+    if (window.HanziWriter) {
+      resolve(window.HanziWriter);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src =
+      "https://cdn.jsdelivr.net/npm/hanzi-writer@3.5/dist/hanzi-writer.min.js";
+    s.onload = () => resolve(window.HanziWriter);
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return hwScriptPromise;
+}
+
 // ── Font preload ──────────────────────────────────────────────────────────────
 let fontReady = false;
 document.fonts.load("700 120px 'Yuji Syuku'").then(() => {
@@ -143,363 +162,6 @@ function drawKanjiLayer(ctx, kanji, size, alpha) {
   ctx.restore();
 }
 
-// ── KanjiVG fetch & parse ─────────────────────────────────────────────────────
-// Uses npm package on jsdelivr (allowed by CSP): cdn.jsdelivr.net/npm/kanjivg/
-const kvgCache = {};
-
-async function fetchKanjiVG(kanji) {
-  if (kvgCache[kanji] !== undefined) return kvgCache[kanji];
-  const hex = kanji.codePointAt(0).toString(16).padStart(5, "0");
-  const url = `https://cdn.jsdelivr.net/npm/kanjivg@20160426/kanji/${hex}.svg`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("not found");
-    const text = await res.text();
-    const strokes = parseKVGStrokes(text);
-    kvgCache[kanji] = strokes;
-    return strokes;
-  } catch {
-    kvgCache[kanji] = null;
-    return null;
-  }
-}
-
-function parseKVGStrokes(svgText) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(svgText, "image/svg+xml");
-  const paths = Array.from(doc.querySelectorAll("path[d]"));
-  return paths.map((p) => p.getAttribute("d")).filter(Boolean);
-}
-
-// Get a point at fraction t along an SVG path using a temporary SVG element
-function getPathPoint(dStr, t) {
-  const ns = "http://www.w3.org/2000/svg";
-  const svg = document.createElementNS(ns, "svg");
-  svg.style.cssText = "position:absolute;visibility:hidden;width:0;height:0";
-  const path = document.createElementNS(ns, "path");
-  path.setAttribute("d", dStr);
-  svg.appendChild(path);
-  document.body.appendChild(svg);
-  try {
-    const len = path.getTotalLength();
-    const pt = path.getPointAtLength(t * len);
-    const ptEnd = path.getPointAtLength(Math.min((t + 0.05) * len, len));
-    return {
-      x: pt.x,
-      y: pt.y,
-      angle: Math.atan2(ptEnd.y - pt.y, ptEnd.x - pt.x),
-      len,
-    };
-  } finally {
-    document.body.removeChild(svg);
-  }
-}
-
-// ── Stroke Order Panel ────────────────────────────────────────────────────────
-const PANEL_SZ = 140; // size of the mini SVG panel
-const KVG_VIEWBOX = 109;
-const SCALE = PANEL_SZ / KVG_VIEWBOX;
-const COLORS = [
-  "#e05010",
-  "#1060d0",
-  "#208030",
-  "#9010a0",
-  "#c08010",
-  "#106080",
-];
-
-function StrokeOrderPanel({ kanji }) {
-  const [strokes, setStrokes] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [activeIdx, setActiveIdx] = useState(-1); // -1 = show all
-  const [animating, setAnimating] = useState(false);
-  const animRef = useRef(null);
-
-  useEffect(() => {
-    setLoading(true);
-    setStrokes(null);
-    setActiveIdx(-1);
-    fetchKanjiVG(kanji).then((s) => {
-      setStrokes(s);
-      setLoading(false);
-    });
-    return () => clearTimeout(animRef.current);
-  }, [kanji]);
-
-  const playAnimation = useCallback(() => {
-    if (!strokes) return;
-    setAnimating(true);
-    setActiveIdx(0);
-    let i = 0;
-    const step = () => {
-      i++;
-      if (i < strokes.length) {
-        setActiveIdx(i);
-        animRef.current = setTimeout(step, 800);
-      } else {
-        animRef.current = setTimeout(() => {
-          setActiveIdx(-1);
-          setAnimating(false);
-        }, 800);
-      }
-    };
-    animRef.current = setTimeout(step, 800);
-  }, [strokes]);
-
-  if (loading)
-    return (
-      <div
-        style={{
-          textAlign: "center",
-          padding: "10px 0",
-          color: "#9a8050",
-          fontSize: 11,
-        }}
-      >
-        Loading stroke order…
-      </div>
-    );
-  if (!strokes || !strokes.length)
-    return (
-      <div
-        style={{
-          textAlign: "center",
-          padding: "10px 0",
-          color: "#9a8050",
-          fontSize: 11,
-        }}
-      >
-        Stroke order unavailable
-      </div>
-    );
-
-  // Build arrow head at ~85% along each stroke
-  function arrowForStroke(d, color) {
-    try {
-      const pt = getPathPoint(d, 0.82);
-      const ax = pt.x * SCALE,
-        ay = pt.y * SCALE;
-      const ang = pt.angle;
-      const size = 5;
-      const cos = Math.cos(ang),
-        sin = Math.sin(ang);
-      // Arrow tip at ax,ay pointing in direction ang
-      const tip = `${ax},${ay}`;
-      const left = `${ax - size * cos + size * 0.5 * sin},${ay - size * sin - size * 0.5 * cos}`;
-      const right = `${ax - size * cos - size * 0.5 * sin},${ay - size * sin + size * 0.5 * cos}`;
-      return (
-        <polygon
-          key="arr"
-          points={`${tip} ${left} ${right}`}
-          fill={color}
-          opacity={0.9}
-        />
-      );
-    } catch {
-      return null;
-    }
-  }
-
-  return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 8,
-      }}
-    >
-      {/* Grid of individual stroke steps */}
-      <div
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          gap: 6,
-          justifyContent: "center",
-        }}
-      >
-        {strokes.map((d, i) => {
-          const color = COLORS[i % COLORS.length];
-          const isActive = activeIdx === i;
-          return (
-            <div
-              key={i}
-              onClick={() => setActiveIdx(activeIdx === i ? -1 : i)}
-              style={{
-                cursor: "pointer",
-                border: `2px solid ${isActive ? color : "#d4c89a"}`,
-                borderRadius: 4,
-                background: isActive ? `${color}12` : "#fff8ee",
-                padding: 2,
-                transition: "all 0.2s",
-              }}
-            >
-              <svg
-                width={PANEL_SZ}
-                height={PANEL_SZ}
-                viewBox={`0 0 ${KVG_VIEWBOX} ${KVG_VIEWBOX}`}
-                style={{ display: "block" }}
-              >
-                {/* Previous strokes faint */}
-                {strokes.slice(0, i).map((prev, j) => (
-                  <path
-                    key={j}
-                    d={prev}
-                    stroke="#c8c0a8"
-                    strokeWidth="3"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    fill="none"
-                    opacity={0.4}
-                  />
-                ))}
-                {/* Current stroke highlighted */}
-                <path
-                  d={d}
-                  stroke={color}
-                  strokeWidth="4"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  fill="none"
-                />
-                {/* Direction arrow */}
-                {arrowForStroke(d, color)}
-                {/* Start dot */}
-                {(() => {
-                  try {
-                    const pt = getPathPoint(d, 0);
-                    return (
-                      <circle
-                        cx={pt.x}
-                        cy={pt.y}
-                        r="3.5"
-                        fill={color}
-                        opacity={0.85}
-                      />
-                    );
-                  } catch {
-                    return null;
-                  }
-                })()}
-                {/* Stroke number */}
-                <text
-                  x="4"
-                  y="13"
-                  fontSize="11"
-                  fontWeight="700"
-                  fill={color}
-                  opacity={0.9}
-                >
-                  {i + 1}
-                </text>
-              </svg>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Full composite view */}
-      <div
-        style={{
-          border: "2px solid #d4c89a",
-          borderRadius: 4,
-          background: "#fff8ee",
-          padding: 4,
-        }}
-      >
-        <svg
-          width={PANEL_SZ}
-          height={PANEL_SZ}
-          viewBox={`0 0 ${KVG_VIEWBOX} ${KVG_VIEWBOX}`}
-          style={{ display: "block" }}
-        >
-          {strokes.map((d, i) => {
-            const color = COLORS[i % COLORS.length];
-            const show = activeIdx === -1 || i <= activeIdx;
-            const isActive = activeIdx === i;
-            return show ? (
-              <g key={i}>
-                <path
-                  d={d}
-                  stroke={isActive ? color : "#3a2a10"}
-                  strokeWidth={isActive ? 4.5 : 3}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  fill="none"
-                  opacity={isActive ? 1 : 0.55}
-                />
-                {(activeIdx === -1 || isActive) && arrowForStroke(d, color)}
-                {(activeIdx === -1 || isActive) &&
-                  (() => {
-                    try {
-                      const pt = getPathPoint(d, 0);
-                      return (
-                        <circle
-                          cx={pt.x}
-                          cy={pt.y}
-                          r="3"
-                          fill={color}
-                          opacity={0.8}
-                        />
-                      );
-                    } catch {
-                      return null;
-                    }
-                  })()}
-                {activeIdx === -1 &&
-                  (() => {
-                    try {
-                      const pt = getPathPoint(d, 0);
-                      return (
-                        <text
-                          x={pt.x + 3}
-                          y={pt.y - 3}
-                          fontSize="8"
-                          fontWeight="700"
-                          fill={color}
-                          opacity={0.85}
-                        >
-                          {i + 1}
-                        </text>
-                      );
-                    } catch {
-                      return null;
-                    }
-                  })()}
-              </g>
-            ) : null;
-          })}
-        </svg>
-      </div>
-
-      {/* Play animation button */}
-      <button
-        onClick={playAnimation}
-        disabled={animating}
-        style={{
-          background: animating
-            ? "#c8b882"
-            : "linear-gradient(135deg,#4060a0,#6080cc)",
-          border: "none",
-          borderRadius: 3,
-          color: "#fff",
-          fontSize: 11,
-          padding: "6px 16px",
-          cursor: animating ? "default" : "pointer",
-          fontFamily: "'Noto Serif JP', serif",
-          letterSpacing: 1,
-        }}
-      >
-        {animating ? "▶ Playing…" : "▶ Animate stroke order"}
-      </button>
-
-      <p style={{ fontSize: 9, color: "#b0a070" }}>
-        KanjiVG © Ulrich Apel · CC BY-SA 3.0 · kanjivg.tagaini.net
-      </p>
-    </div>
-  );
-}
-
 // ── Stroke math ───────────────────────────────────────────────────────────────
 function downsample(pts, d = 5) {
   if (pts.length < 2) return pts;
@@ -513,6 +175,217 @@ function downsample(pts, d = 5) {
   if (out[out.length - 1] !== pts[pts.length - 1])
     out.push(pts[pts.length - 1]);
   return out;
+}
+
+// ── HanziWriter stroke order panel ───────────────────────────────────────────
+function StrokeOrderPanel({ kanji }) {
+  const containerRef = useRef(null);
+  const writerRef = useRef(null);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [animating, setAnimating] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setStatus("loading");
+    setAnimating(false);
+    writerRef.current = null;
+
+    loadHanziWriter()
+      .then((HanziWriter) => {
+        if (cancelled || !containerRef.current) return;
+        // Clear any previous writer
+        containerRef.current.innerHTML = "";
+
+        try {
+          const writer = HanziWriter.create(containerRef.current, kanji, {
+            width: 200,
+            height: 200,
+            padding: 10,
+            showOutline: true,
+            strokeColor: "#1a0f05",
+            outlineColor: "#ddd0aa",
+            drawingColor: "#1a3acc",
+            strokeAnimationSpeed: 1.2,
+            delayBetweenStrokes: 300,
+            charDataLoader: (char, onComplete, onError) => {
+              fetch(
+                `https://cdn.jsdelivr.net/npm/hanzi-writer-data-jp@latest/${encodeURIComponent(char)}.json`,
+              )
+                .then((r) => {
+                  if (!r.ok) throw new Error("404");
+                  return r.json();
+                })
+                .then(onComplete)
+                .catch(() => {
+                  // fallback to base hanzi-writer-data
+                  fetch(
+                    `https://cdn.jsdelivr.net/npm/hanzi-writer-data@latest/${encodeURIComponent(char)}.json`,
+                  )
+                    .then((r) => r.json())
+                    .then(onComplete)
+                    .catch(onError);
+                });
+            },
+            onLoadCharDataSuccess: () => {
+              if (!cancelled) setStatus("ready");
+            },
+            onLoadCharDataError: () => {
+              if (!cancelled) setStatus("error");
+            },
+          });
+          writerRef.current = writer;
+        } catch {
+          if (!cancelled) setStatus("error");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setStatus("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [kanji]);
+
+  const animate = () => {
+    if (!writerRef.current || animating) return;
+    setAnimating(true);
+    writerRef.current.animateCharacter({
+      onComplete: () => setAnimating(false),
+    });
+  };
+
+  const showOutline = () => {
+    if (!writerRef.current) return;
+    writerRef.current.showCharacter();
+    writerRef.current.hideCharacter({ duration: 0 });
+    writerRef.current.showOutline();
+  };
+
+  const reset = () => {
+    if (!writerRef.current) return;
+    writerRef.current.showCharacter({ duration: 200 });
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 10,
+      }}
+    >
+      <p
+        style={{
+          fontSize: 11,
+          color: "#7a6040",
+          letterSpacing: 2,
+          fontFamily: "'Yuji Syuku', serif",
+        }}
+      >
+        筆順 · Stroke Order · {kanji}
+      </p>
+
+      {/* HanziWriter renders into this div */}
+      <div style={{ position: "relative" }}>
+        <div
+          ref={containerRef}
+          style={{
+            width: 200,
+            height: 200,
+            background: "#fff8ee",
+            borderRadius: 4,
+            border: "2px solid #c8b882",
+            overflow: "hidden",
+          }}
+        />
+        {status === "loading" && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "rgba(253,246,227,0.85)",
+              borderRadius: 4,
+            }}
+          >
+            <span style={{ fontSize: 11, color: "#9a8050" }}>Loading…</span>
+          </div>
+        )}
+        {status === "error" && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "rgba(253,246,227,0.9)",
+              borderRadius: 4,
+            }}
+          >
+            <span style={{ fontSize: 11, color: "#9a4040" }}>
+              Data unavailable
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Controls */}
+      {status === "ready" && (
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            flexWrap: "wrap",
+            justifyContent: "center",
+          }}
+        >
+          <button
+            onClick={animate}
+            disabled={animating}
+            style={{
+              background: animating
+                ? "#c8b882"
+                : "linear-gradient(135deg,#4060a0,#6080cc)",
+              border: "none",
+              borderRadius: 3,
+              color: "#fff",
+              fontSize: 12,
+              padding: "7px 16px",
+              cursor: animating ? "default" : "pointer",
+              fontFamily: "'Noto Serif JP', serif",
+              letterSpacing: 1,
+            }}
+          >
+            {animating ? "▶ Playing…" : "▶ Animate"}
+          </button>
+          <button
+            onClick={reset}
+            style={{
+              background: "transparent",
+              border: "1.5px solid #4060a0",
+              borderRadius: 3,
+              color: "#4060a0",
+              fontSize: 12,
+              padding: "7px 14px",
+              cursor: "pointer",
+              fontFamily: "'Noto Serif JP', serif",
+            }}
+          >
+            Show full
+          </button>
+        </div>
+      )}
+
+      <p style={{ fontSize: 9, color: "#b0a070" }}>
+        hanzi-writer-data-jp · animCJK · CC BY-SA 3.0
+      </p>
+    </div>
+  );
 }
 
 // ── Drawing Canvas ────────────────────────────────────────────────────────────
@@ -577,14 +450,12 @@ function DrawingCanvas({
     [canvasRef, kanji],
   );
 
-  // Mount only — reset strokes
   useEffect(() => {
     allStrokes.current = [];
     repaint([], { guide: showGuide, overlay: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Guide / overlay toggle — repaint without resetting strokes
   useEffect(() => {
     repaint(allStrokes.current, { guide: showGuide, overlay: showOverlay });
   }, [showGuide, showOverlay, repaint]);
@@ -810,7 +681,7 @@ export default function KanjiQuiz() {
   return (
     <>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Yuji+Syuku&family=Noto+Serif+JP:wght@400;700&family=Shippori+Mincho:wght@400;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Yuji+Syuku&family=Noto+Serif+JP:wght@400;700&display=swap');
         @keyframes fadeIn  { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
         @keyframes slideUp { from{opacity:0;transform:translateY(18px)} to{opacity:1;transform:translateY(0)} }
         * { box-sizing:border-box; margin:0; padding:0; }
@@ -917,7 +788,6 @@ export default function KanjiQuiz() {
                 border: "1px solid #c8b882",
               }}
             >
-              {/* Prompt */}
               <div style={{ textAlign: "center", marginBottom: 12 }}>
                 <p
                   style={{
@@ -1051,7 +921,7 @@ export default function KanjiQuiz() {
                 showOverlay={!!result}
               />
 
-              {/* Legend after check */}
+              {/* Legend */}
               {result && (
                 <div
                   style={{
@@ -1238,15 +1108,15 @@ export default function KanjiQuiz() {
                       )}
                     </div>
 
-                    {/* ── Stroke order toggle button ── */}
+                    {/* Stroke order toggle */}
                     <button
                       onClick={() => setShowStrokeOrder((s) => !s)}
                       style={{
                         marginTop: 10,
                         background: showStrokeOrder
-                          ? `linear-gradient(135deg,#4060a0,#6080cc)`
+                          ? "linear-gradient(135deg,#4060a0,#6080cc)"
                           : "transparent",
-                        border: `1.5px solid #4060a0`,
+                        border: "1.5px solid #4060a0",
                         borderRadius: 3,
                         color: showStrokeOrder ? "#fff" : "#4060a0",
                         fontSize: 12,
@@ -1259,39 +1129,26 @@ export default function KanjiQuiz() {
                     >
                       {showStrokeOrder
                         ? "▲ Hide stroke order"
-                        : "▼ Show stroke order 筆順"}
+                        : "▼ Stroke order  筆順"}
                     </button>
 
                     <p style={{ fontSize: 9, color: "#b0a070", marginTop: 8 }}>
-                      KANJIDIC2 © EDRDG · Font: Yuji Syuku · KanjiVG © Ulrich
-                      Apel CC BY-SA 3.0
+                      KANJIDIC2 © EDRDG · Yuji Syuku © Google Fonts
                     </p>
                   </div>
 
-                  {/* ── Stroke Order Panel ── */}
+                  {/* Stroke order panel */}
                   {showStrokeOrder && (
                     <div
                       style={{
                         marginTop: 10,
-                        padding: "14px",
+                        padding: "16px",
                         background: "#fdf6e3",
                         border: "1.5px solid #c8b882",
                         borderRadius: 4,
                         animation: "fadeIn 0.25s ease",
                       }}
                     >
-                      <p
-                        style={{
-                          textAlign: "center",
-                          fontSize: 11,
-                          color: "#7a6040",
-                          letterSpacing: 2,
-                          marginBottom: 10,
-                          fontFamily: "'Yuji Syuku', serif",
-                        }}
-                      >
-                        筆順 · Stroke Order · {current.kanji}
-                      </p>
                       <StrokeOrderPanel kanji={current.kanji} />
                     </div>
                   )}
@@ -1477,7 +1334,7 @@ export default function KanjiQuiz() {
                 ))}
               </div>
               <p style={{ fontSize: 9, color: "#b0a070", marginBottom: 18 }}>
-                KANJIDIC2 © EDRDG · KanjiVG © Ulrich Apel CC BY-SA 3.0
+                KANJIDIC2 © EDRDG · hanzi-writer-data-jp · animCJK
               </p>
               <button
                 onClick={restart}
@@ -1501,7 +1358,7 @@ export default function KanjiQuiz() {
             letterSpacing: 2,
           }}
         >
-          KANJIDIC2 © EDRDG · KanjiVG © Ulrich Apel CC BY-SA 3.0
+          KANJIDIC2 © EDRDG · hanzi-writer · animCJK · CC BY-SA 3.0
         </p>
         <div
           style={{
